@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- kumanda gövdesi -->
+    <path android:fillColor="#ECEDEF" android:pathData="M42,26h24a6,6 0 0 1 6,6v44a6,6 0 0 1 -6,6h-24a6,6 0 0 1 -6,-6v-44a6,6 0 0 1 6,-6z" />
+    <!-- yön halkası -->
+    <path android:fillColor="#3D7EFF" android:pathData="M54,36a10,10 0 1 1 0,20a10,10 0 1 1 0,-20z" />
+    <path android:fillColor="#ECEDEF" android:pathData="M54,42a4,4 0 1 1 0,8a4,4 0 1 1 0,-8z" />
+    <!-- tuşlar -->
+    <path android:fillColor="#5A6275" android:pathData="M44,62h6v5h-6z M58,62h6v5h-6z M44,71h6v5h-6z M58,71h6v5h-6z" />
+    <path android:fillColor="#C8384A" android:pathData="M51,29h6v3h-6z" />
+</vector>
