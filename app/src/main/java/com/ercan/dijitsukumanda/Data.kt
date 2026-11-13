@@ -76,6 +76,9 @@ object Prefs {
     fun port(c: Context) = p(c).getInt("port", 5555)
     fun setHost(c: Context, h: String, port: Int) = p(c).edit().putString("host", h).putInt("port", port).apply()
 
+    fun fastKeys(c: Context) = p(c).getBoolean("fastkeys", true)
+    fun setFastKeys(c: Context, v: Boolean) = p(c).edit().putBoolean("fastkeys", v).apply()
+
     fun volumeKeys(c: Context) = p(c).getBoolean("volkeys", true)
     fun setVolumeKeys(c: Context, v: Boolean) = p(c).edit().putBoolean("volkeys", v).apply()
 

@@ -29,5 +29,5 @@ class App : Application() {
 }
 
 object BuildInfo {
-    const val VERSION = "1.1"
+    const val VERSION = "1.2"
 }

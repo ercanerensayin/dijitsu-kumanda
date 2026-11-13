@@ -4,8 +4,10 @@ import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.view.KeyEvent
 import com.ercan.dijitsukumanda.adb.AdbConnection
 import com.ercan.dijitsukumanda.adb.AdbCrypto
+import com.ercan.dijitsukumanda.adb.AdbStream
 import java.security.KeyPair
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -55,12 +57,14 @@ object Tv {
             try {
                 connectNow(host, port)
                 readVolumeSync()
+                fastStream() // ilk tuşta beklememek için dinleyiciyi hemen başlat
             } catch (_: Exception) {}
         }
     }
 
     fun disconnect() {
         exec.execute {
+            stopFastNow()
             conn?.close()
             conn = null
             setState(State.KOPUK)
@@ -74,6 +78,7 @@ object Tv {
         }
         conn?.close()
         conn = null
+        monkeyTcp = null; monkeyShell = null; fastFailed = false
         setState(State.BAGLANIYOR, "$host:$port")
         try {
             val c = AdbConnection.connect(host, port, keys) {
@@ -158,6 +163,15 @@ object Tv {
                             b
                         }
                         if (batch.isEmpty()) break
+                        val m = fastStream()
+                        if (m != null) {
+                            try {
+                                for (k in batch) m.write("press " + KeyEvent.keyCodeToString(k) + "\n")
+                                continue
+                            } catch (e: Exception) {
+                                stopFastNow()
+                            }
+                        }
                         execSync("input keyevent " + batch.joinToString(" "))
                     }
                 } finally {
@@ -167,6 +181,56 @@ object Tv {
             }
         }
     }
+
+    // ---------- Hızlı tuş modu ----------
+    // "input keyevent" her seferinde TV'de yeni bir program başlatır (~0,9 sn).
+    // monkey --port ise sürekli açık kalır; tuşları milisaniyeler içinde işler.
+    // Yalnızca kumanda ekranı açıkken çalışır, uygulama arka plana geçince kapatılır.
+
+    @Volatile private var monkeyShell: AdbStream? = null
+    @Volatile private var monkeyTcp: AdbStream? = null
+    @Volatile private var fastFailed = false
+    @Volatile var fastWanted = false
+
+    private fun fastStream(): AdbStream? {
+        if (!fastWanted || fastFailed || !Prefs.fastKeys(app)) return null
+        monkeyTcp?.let { if (!it.closed) return it }
+        val c = ensure()
+        return try {
+            monkeyShell?.close()
+            monkeyShell = c.open("shell:monkey --port 1080")
+            var t: AdbStream? = null
+            for (i in 0 until 10) {
+                Thread.sleep(300)
+                try { t = c.open("tcp:1080"); break } catch (_: Exception) {}
+            }
+            if (t == null) { fastFailed = true; stopFastNow(); null } else { monkeyTcp = t; t }
+        } catch (e: Exception) {
+            fastFailed = true
+            stopFastNow()
+            null
+        }
+    }
+
+    private fun stopFastNow() {
+        try { monkeyTcp?.let { if (!it.closed) it.write("quit\n") } } catch (_: Exception) {}
+        try { monkeyTcp?.close() } catch (_: Exception) {}
+        try { monkeyShell?.close() } catch (_: Exception) {}
+        monkeyTcp = null
+        monkeyShell = null
+    }
+
+    /** Uygulama ön plandayken hızlı modu aç/kapat. */
+    fun setForeground(fg: Boolean) {
+        fastWanted = fg
+        if (fg) exec.execute { try { if (isConnected) fastStream() } catch (_: Exception) {} }
+        if (!fg) exec.execute {
+            stopFastNow()
+            try { conn?.exec("pkill -f com.android.commands.monkey", 3000) } catch (_: Exception) {}
+        }
+    }
+
+    val fastActive get() = monkeyTcp?.closed == false
 
     // ---------- Ses: yalnızca en son istenen değer uygulanır ----------
 
@@ -205,7 +269,7 @@ object Tv {
 
     private fun readVolumeSync() {
         val out = execSync(
-            "cmd media_session volume --stream 3 --get 2>/dev/null || media volume --stream 3 --get"
+            "media volume --stream 3 --get 2>&1 | grep 'volume is' || cmd media_session volume --stream 3 --get"
         )
         val m = Regex("""volume is (\d+) in range \[(\d+)\.\.(\d+)]""").find(out) ?: return
         volume = m.groupValues[1].toInt()
@@ -215,7 +279,7 @@ object Tv {
 
     fun volumeSync(level: Int) {
         execSync(
-            "cmd media_session volume --show --stream 3 --set $level 2>/dev/null || media volume --show --stream 3 --set $level"
+            "if command -v media >/dev/null; then media volume --show --stream 3 --set $level; else cmd media_session volume --show --stream 3 --set $level; fi"
         )
     }
 
@@ -272,8 +336,10 @@ object Tv {
         return list
     }
 
-    fun switchInputSync(id: String) {
-        execSync("am start -a android.intent.action.VIEW -d 'content://android.media.tv/passthrough/${Uri.encode(id)}'")
+    /** Girişe geçmeyi dener; TV niyet (intent) ile geçişi desteklemiyorsa false döner. */
+    fun switchInputSync(id: String): Boolean {
+        val out = execSync("am start -a android.intent.action.VIEW -d 'content://android.media.tv/passthrough/${Uri.encode(id)}'")
+        return !out.contains("Error")
     }
 
     fun hdmiSync(n: Int) {
@@ -282,8 +348,8 @@ object Tv {
             discoverInputsSync()
             id = Prefs.hdmiId(app, n)
         }
-        if (id.isNotEmpty()) switchInputSync(id)
-        else keySync(242 + n) // KEYCODE_TV_INPUT_HDMI_1 = 243
+        if (id.isNotEmpty() && switchInputSync(id)) return
+        keySync(242 + n) // KEYCODE_TV_INPUT_HDMI_1 = 243
     }
 
     fun turkceSadele(s: String): String {

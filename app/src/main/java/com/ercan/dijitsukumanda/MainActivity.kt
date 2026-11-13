@@ -110,6 +110,16 @@ class MainActivity : Activity() {
         if (!Tv.isConnected && Prefs.host(this).isNotBlank()) Tv.connect()
     }
 
+    override fun onStart() {
+        super.onStart()
+        Tv.setForeground(true)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        Tv.setForeground(false)
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         Tv.onState = null
@@ -495,6 +505,16 @@ class MainActivity : Activity() {
             setPadding(dp(4), dp(8), dp(4), dp(8))
         }
         c.addView(sw)
+
+        c.addView(label("Hızlı tuş modu"))
+        c.addView(Switch(this).apply {
+            text = "Tuşları anında gönder (önerilir)"
+            setTextColor(TEXT)
+            isChecked = Prefs.fastKeys(this@MainActivity)
+            setOnCheckedChangeListener { _, v -> Prefs.setFastKeys(this@MainActivity, v) }
+            setPadding(dp(4), dp(8), dp(4), dp(8))
+        })
+        c.addView(hint("Açıkken uygulama, TV'de tuşları bekletmeden işleyen küçük bir dinleyici (monkey) çalıştırır; tuşlar yaklaşık 0,9 sn yerine anında gider. Uygulama kapanınca dinleyici de kapanır. Bir TV uygulaması tuhaf davranırsa bunu kapat."))
 
         c.addView(label("HDMI girişleri"))
         val hdmiInfo = hint(hdmiSummary())
