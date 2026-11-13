@@ -5,13 +5,16 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.speech.RecognizerIntent
 import android.text.InputType
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -45,6 +48,11 @@ class MainActivity : Activity() {
     private lateinit var content: FrameLayout
     private val tabs = ArrayList<TextView>()
     private var currentTab = 0
+    private val volumeBars = ArrayList<VolumeBar>()
+    private var lastTextInput: EditText? = null
+
+    private val REQ_DICTATE = 11
+    private val REQ_COMMAND = 12
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -90,7 +98,11 @@ class MainActivity : Activity() {
         root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
 
-        Tv.onState = { s, msg -> updateStatus(s, msg) }
+        Tv.onState = { s, msg ->
+            updateStatus(s, msg)
+            if (s == Tv.State.BAGLI) Tv.refreshVolume()
+        }
+        Tv.onVolume = { v, m -> volumeBars.forEach { it.set(v, m) } }
         updateStatus(Tv.state, "")
         showTab(0)
 
@@ -101,6 +113,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         Tv.onState = null
+        Tv.onVolume = null
     }
 
     // Telefonun ses tuşları → TV sesi
@@ -110,7 +123,7 @@ class MainActivity : Activity() {
             Prefs.volumeKeys(this) && Tv.isConnected
         ) {
             if (event.action == KeyEvent.ACTION_DOWN) {
-                Tv.key(if (code == KeyEvent.KEYCODE_VOLUME_UP) Keys.VOL_UP else Keys.VOL_DOWN)
+                Tv.volumeStep(if (code == KeyEvent.KEYCODE_VOLUME_UP) 1 else -1)
             }
             return true
         }
@@ -148,6 +161,7 @@ class MainActivity : Activity() {
             t.typeface = if (idx == i) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
         }
         content.removeAllViews()
+        volumeBars.clear()
         val page = when (i) {
             0 -> remotePage()
             1 -> touchPage()
@@ -156,6 +170,7 @@ class MainActivity : Activity() {
             else -> settingsPage()
         }
         content.addView(page)
+        if (Tv.isConnected && (i == 0 || i == 1)) Tv.refreshVolume()
     }
 
     // ===================== KUMANDA =====================
@@ -179,7 +194,9 @@ class MainActivity : Activity() {
         c.addView(row(h, spacer(), keyBtn("▼", Keys.DOWN, repeat = true), spacer()))
         c.addView(gap(10))
         c.addView(row(keyBtn("↩ Geri", Keys.BACK), keyBtn("⌂ Ana", Keys.HOME), keyBtn("☰ Menü", Keys.MENU), keyBtn("⚙", Keys.SETTINGS)))
-        c.addView(row(keyBtn("Ses −", Keys.VOL_DOWN, repeat = true), keyBtn("🔇", Keys.MUTE), keyBtn("Ses +", Keys.VOL_UP, repeat = true)))
+        c.addView(gap(6))
+        c.addView(volumeBar())
+        c.addView(row(holdBtn("Ses −") { Tv.volumeStep(-1) }, keyBtn("🔇 Sessiz", Keys.MUTE), holdBtn("Ses +") { Tv.volumeStep(1) }))
         c.addView(row(keyBtn("Kanal −", Keys.CH_DOWN), keyBtn("Son uyg.", Keys.RECENTS), keyBtn("Kanal +", Keys.CH_UP)))
         c.addView(row(keyBtn("⏪", Keys.REWIND, repeat = true), keyBtn("⏯", Keys.PLAY_PAUSE), keyBtn("⏩", Keys.FORWARD, repeat = true)))
 
@@ -191,11 +208,17 @@ class MainActivity : Activity() {
             sendText(input); true
         }
         c.addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) })
+        lastTextInput = input
         c.addView(row(
             btn("Gönder", ACCENT) { sendText(input) },
             keyBtn("⌫ Sil", Keys.DEL, repeat = true),
             keyBtn("Enter", Keys.ENTER)
         ))
+        c.addView(row(
+            btn("🎤 Sesle yaz") { listen(REQ_DICTATE, "TV'ye yazılacak metni söyle") },
+            btn("🎤 Sesli komut", ACCENT) { listen(REQ_COMMAND, "Komutu söyle (ör. HDMI 2, sesi 10 yap, YouTube aç)") }
+        ))
+        c.addView(hint(Voice.HELP))
         c.addView(hint("Türkçe harfler (ş, ğ, ı…) TV'ye düz harf olarak gider; adb'nin yazı komutu yalnızca İngilizce karakterleri destekliyor."))
 
         // Favoriler
@@ -231,6 +254,7 @@ class MainActivity : Activity() {
         val c = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(10), dp(6), dp(10), dp(10)) }
         val pad = TouchPad(this)
         c.addView(pad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        c.addView(volumeBar())
         c.addView(hint("Kaydır: yön tuşları • Dokun: OK • Uzun bas: Geri • Telefonun ses tuşları TV'nin sesini değiştirir"))
         c.addView(row(keyBtn("↩ Geri", Keys.BACK), keyBtn("⌂ Ana", Keys.HOME), keyBtn("⏯", Keys.PLAY_PAUSE), keyBtn("🔇", Keys.MUTE)))
         return c
@@ -636,8 +660,9 @@ class MainActivity : Activity() {
         b.setOnClickListener(null)
         val repeater = object : Runnable {
             override fun run() {
-                Tv.key(code)
-                b.postDelayed(this, 160)
+                // Önceki basışlar gitmeden yenisini ekleme: bırakınca hemen durur
+                if (!Tv.hasPendingKeys()) Tv.key(code)
+                b.postDelayed(this, 120)
             }
         }
         b.setOnTouchListener { v, e ->
@@ -651,10 +676,85 @@ class MainActivity : Activity() {
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     v.alpha = 1f
                     v.removeCallbacks(repeater)
+                    if (repeat) Tv.clearPendingKeys()
                 }
             }
             true
         }
         return b
+    }
+
+    /** Basılı tutulunca işlemi tekrar eden düğme (ses +/- için). */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun holdBtn(text: String, action: () -> Unit): TextView {
+        val b = btn(text) {}
+        b.setOnClickListener(null)
+        val repeater = object : Runnable {
+            override fun run() {
+                action()
+                b.postDelayed(this, 130)
+            }
+        }
+        b.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    v.alpha = 0.6f
+                    action()
+                    v.postDelayed(repeater, 400)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.alpha = 1f
+                    v.removeCallbacks(repeater)
+                }
+            }
+            true
+        }
+        return b
+    }
+
+    private fun volumeBar(): VolumeBar {
+        val bar = VolumeBar(this, ACCENT, CARD, TEXT)
+        bar.set(Tv.volume, Tv.volumeMax)
+        bar.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { setMargins(dp(4), dp(4), dp(4), dp(4)) }
+        volumeBars.add(bar)
+        return bar
+    }
+
+    // ===================== SES TANIMA =====================
+
+    private fun listen(req: Int, prompt: String) {
+        if (!Tv.isConnected && Prefs.host(this).isBlank()) { toast("Önce TV'ye bağlan"); return }
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "tr-TR")
+            putExtra(RecognizerIntent.EXTRA_PROMPT, prompt)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(i, req)
+        } catch (_: ActivityNotFoundException) {
+            toast("Telefonda ses tanıma bulunamadı (Google uygulaması gerekli)")
+        }
+    }
+
+    @Deprecated("Activity API")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != RESULT_OK || data == null) return
+        val spoken = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull() ?: return
+        when (requestCode) {
+            REQ_DICTATE -> {
+                Tv.text(spoken)
+                toast("Yazıldı: $spoken")
+            }
+            REQ_COMMAND -> {
+                val r = Voice.handle(this, spoken) { msg -> ui.post { toast(msg) } }
+                toast("“$spoken” → $r")
+            }
+        }
     }
 }

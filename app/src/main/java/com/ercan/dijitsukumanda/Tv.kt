@@ -6,11 +6,12 @@ import android.os.Handler
 import android.os.Looper
 import com.ercan.dijitsukumanda.adb.AdbConnection
 import com.ercan.dijitsukumanda.adb.AdbCrypto
-import com.ercan.dijitsukumanda.adb.AdbStream
 import java.security.KeyPair
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** TV ile tüm iletişim buradan geçer. Komutlar tek bir sırada (kuyrukta) çalışır. */
 object Tv {
@@ -22,13 +23,19 @@ object Tv {
     private val main = Handler(Looper.getMainLooper())
 
     @Volatile private var conn: AdbConnection? = null
-    @Volatile private var shell: AdbStream? = null
 
     @Volatile var state = State.KOPUK
         private set
     var lastError = ""
         private set
     var onState: ((State, String) -> Unit)? = null
+
+    // Ses durumu (TV'den okunur)
+    @Volatile var volume = -1
+        private set
+    @Volatile var volumeMax = 15
+        private set
+    var onVolume: ((Int, Int) -> Unit)? = null
 
     fun init(ctx: Context) {
         app = ctx.applicationContext
@@ -43,10 +50,12 @@ object Tv {
         main.post { onState?.invoke(s, msg) }
     }
 
-    /** Ayarlardaki adrese bağlanır (arka planda). */
     fun connect(host: String = Prefs.host(app), port: Int = Prefs.port(app)) {
         exec.execute {
-            try { connectNow(host, port) } catch (_: Exception) {}
+            try {
+                connectNow(host, port)
+                readVolumeSync()
+            } catch (_: Exception) {}
         }
     }
 
@@ -54,7 +63,6 @@ object Tv {
         exec.execute {
             conn?.close()
             conn = null
-            shell = null
             setState(State.KOPUK)
         }
     }
@@ -66,7 +74,6 @@ object Tv {
         }
         conn?.close()
         conn = null
-        shell = null
         setState(State.BAGLANIYOR, "$host:$port")
         try {
             val c = AdbConnection.connect(host, port, keys) {
@@ -75,7 +82,6 @@ object Tv {
             c.onDisconnected = {
                 if (conn === c) {
                     conn = null
-                    shell = null
                     setState(State.KOPUK, "Bağlantı koptu")
                 }
             }
@@ -106,38 +112,12 @@ object Tv {
         return conn!!
     }
 
-    /** Kalıcı kabuk: tuş komutlarını beklemeden art arda yollamak için. */
-    private fun shellWrite(cmd: String) {
-        val c = ensure()
-        var s = shell
-        if (s == null || s.closed) {
-            s = c.open("shell:")
-            shell = s
-        }
-        s.clear()
-        s.write(cmd + "\n")
-    }
-
-    // ---------- Kuyruğa atılan (beklemeyen) komutlar ----------
-
-    fun key(code: Int) = submit { keySync(code) }
-    fun text(t: String) = submit { textSync(t) }
-    fun hdmi(n: Int) = submit { hdmiSync(n) }
-
-    fun run(cmd: String, done: ((String) -> Unit)? = null) {
-        submit {
-            val out = execSync(cmd)
-            if (done != null) main.post { done(out) }
-        }
-    }
-
     private fun submit(block: () -> Unit): Future<*> = exec.submit {
         try {
             block()
         } catch (e: Exception) {
-            // Kopmuş bağlantıda bir kez yeniden dene
             try {
-                conn?.close(); conn = null; shell = null
+                conn?.close(); conn = null
                 block()
             } catch (e2: Exception) {
                 setState(State.KOPUK, hataMesaji(e2))
@@ -150,15 +130,116 @@ object Tv {
         submit(block).get(30, TimeUnit.SECONDS)
     }
 
-    // ---------- Senkron sürümler (kuyruk iş parçacığında çalışır) ----------
+    // ---------- Tuşlar: birikmeyi önleyen kuyruk ----------
+    // Her basış ayrı komut olursa TV yetişemez ve bırakınca bile devam eder.
+    // Bunun yerine bekleyen basışlar toplanıp tek komutta gönderilir
+    // ve önceki komut bitmeden yenisi gönderilmez.
 
-    fun keySync(code: Int) = shellWrite("input keyevent $code")
+    private val pendingKeys = ArrayDeque<Int>()
+    private val keyWorker = AtomicBoolean(false)
+
+    fun key(code: Int) {
+        synchronized(pendingKeys) { if (pendingKeys.size < 20) pendingKeys.addLast(code) }
+        scheduleKeys()
+    }
+
+    fun hasPendingKeys(): Boolean = synchronized(pendingKeys) { pendingKeys.isNotEmpty() }
+
+    fun clearPendingKeys() = synchronized(pendingKeys) { pendingKeys.clear() }
+
+    private fun scheduleKeys() {
+        if (keyWorker.compareAndSet(false, true)) {
+            submit {
+                try {
+                    while (true) {
+                        val batch = synchronized(pendingKeys) {
+                            val b = ArrayList<Int>()
+                            while (pendingKeys.isNotEmpty() && b.size < 10) b.add(pendingKeys.removeFirst())
+                            b
+                        }
+                        if (batch.isEmpty()) break
+                        execSync("input keyevent " + batch.joinToString(" "))
+                    }
+                } finally {
+                    keyWorker.set(false)
+                    if (hasPendingKeys()) scheduleKeys()
+                }
+            }
+        }
+    }
+
+    // ---------- Ses: yalnızca en son istenen değer uygulanır ----------
+
+    private val pendingVolume = AtomicInteger(-1)
+    private val volWorker = AtomicBoolean(false)
+
+    /** Sesi doğrudan bu seviyeye ayarlar (art arda çağrılarda aradakiler atlanır). */
+    fun setVolume(level: Int) {
+        val v = level.coerceIn(0, volumeMax)
+        volume = v
+        main.post { onVolume?.invoke(v, volumeMax) }
+        pendingVolume.set(v)
+        if (volWorker.compareAndSet(false, true)) {
+            submit {
+                try {
+                    while (true) {
+                        val target = pendingVolume.getAndSet(-1)
+                        if (target < 0) break
+                        volumeSync(target)
+                    }
+                } finally {
+                    volWorker.set(false)
+                    if (pendingVolume.get() >= 0) setVolume(pendingVolume.get())
+                }
+            }
+        }
+    }
+
+    /** Ses +/- : seviye biliniyorsa doğrudan ayarla, bilinmiyorsa tuş gönder. */
+    fun volumeStep(delta: Int) {
+        if (volume >= 0) setVolume(volume + delta)
+        else key(if (delta > 0) Keys.VOL_UP else Keys.VOL_DOWN)
+    }
+
+    fun refreshVolume() = submit { readVolumeSync() }
+
+    private fun readVolumeSync() {
+        val out = execSync(
+            "cmd media_session volume --stream 3 --get 2>/dev/null || media volume --stream 3 --get"
+        )
+        val m = Regex("""volume is (\d+) in range \[(\d+)\.\.(\d+)]""").find(out) ?: return
+        volume = m.groupValues[1].toInt()
+        volumeMax = m.groupValues[3].toInt().coerceAtLeast(1)
+        main.post { onVolume?.invoke(volume, volumeMax) }
+    }
+
+    fun volumeSync(level: Int) {
+        execSync(
+            "cmd media_session volume --show --stream 3 --set $level 2>/dev/null || media volume --show --stream 3 --set $level"
+        )
+    }
+
+    // ---------- Diğer komutlar ----------
+
+    fun text(t: String) = submit { textSync(t) }
+    fun hdmi(n: Int) = submit { hdmiSync(n) }
+
+    fun run(cmd: String, done: ((String) -> Unit)? = null) {
+        submit {
+            val out = execSync(cmd)
+            if (done != null) main.post { done(out) }
+        }
+    }
+
+    fun keySync(code: Int) {
+        execSync("input keyevent $code")
+    }
 
     fun textSync(t: String) {
         val clean = turkceSadele(t)
         if (clean.isEmpty()) return
         val arg = clean.replace(" ", "%s").replace("'", "'\\''")
-        shellWrite("input text '$arg'")
+        execSync("input text '$arg'")
     }
 
     fun execSync(cmd: String): String = ensure().exec(cmd)
@@ -174,15 +255,8 @@ object Tv {
         }
     }
 
-    fun volumeSync(level: Int) {
-        execSync(
-            "cmd media_session volume --show --stream 3 --set $level 2>/dev/null || media volume --show --stream 3 --set $level"
-        )
-    }
-
     // ---------- HDMI girişleri ----------
 
-    /** dumpsys tv_input çıktısından giriş kimliklerini bulur. */
     fun discoverInputsSync(): List<String> {
         val out = execSync("dumpsys tv_input")
         val ids = LinkedHashSet<String>()
@@ -192,7 +266,6 @@ object Tv {
         val hdmis = list.filter { it.contains("hdmi", true) }
             .sortedBy { Regex("""HW(\d+)""").find(it)?.groupValues?.get(1)?.toIntOrNull() ?: 999 }
         Prefs.setInputs(app, list)
-        // Henüz atanmamışsa HDMI 1-2-3'ü sırayla ata
         for (i in 0 until minOf(3, hdmis.size)) {
             if (Prefs.hdmiId(app, i + 1).isEmpty()) Prefs.setHdmiId(app, i + 1, hdmis[i])
         }
